@@ -1,0 +1,17 @@
+# Configuration files
+newsletter.yml
+
+# Environment variables
+.env
+
+# Python cache
+__pycache__/
+
+# Virtual environment
+venv/
+
+# Runtime directory
+runtime/
+
+# OS generated files
+.DS_Store
