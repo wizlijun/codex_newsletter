@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source .venv/bin/activate
+source venv/bin/activate
 
 # 周期运行器：每隔固定时间执行一次任务，并在控制台显示倒计时和详细日志。
 # 每轮会先运行 getmail.py，随后立即运行 readmail_qwen.py。
