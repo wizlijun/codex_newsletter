@@ -50,6 +50,60 @@ except Exception:
 import imaplib
 import yaml
 
+# ----------------------------- Python 3.9+ Compatibility Fix -----------------------------
+# Fix for: property 'file' of 'IMAP4_TLS' object has no setter
+# In Python 3.9+, the 'file' attribute became a read-only property, which breaks PySocks
+# We need to make it writable by replacing the property descriptor before any socket operations
+
+def _make_imaplib_file_writable():
+    """Replace read-only 'file' property with a writable one in all IMAP classes."""
+    import sys
+
+    # Only needed for Python 3.9+
+    if sys.version_info < (3, 9):
+        return
+
+    # Create a custom descriptor that mimics the original property but is writable
+    class FileDescriptor:
+        """A descriptor that allows both reading and writing the 'file' attribute."""
+
+        def __get__(self, obj, objtype=None):
+            if obj is None:
+                return self
+            # Check if explicitly set
+            if '_file_value' in obj.__dict__:
+                return obj.__dict__['_file_value']
+            # Otherwise compute it like the original property
+            if hasattr(obj, 'sock') and obj.sock:
+                return obj.sock.makefile('rb')
+            return None
+
+        def __set__(self, obj, value):
+            # Store in __dict__ to bypass property lookup
+            obj.__dict__['_file_value'] = value
+
+        def __delete__(self, obj):
+            if '_file_value' in obj.__dict__:
+                del obj.__dict__['_file_value']
+
+    # Replace the property in all IMAP4 classes
+    descriptor = FileDescriptor()
+
+    # Patch IMAP4 base class
+    if hasattr(imaplib, 'IMAP4'):
+        imaplib.IMAP4.file = descriptor
+
+    # Patch IMAP4_SSL
+    if hasattr(imaplib, 'IMAP4_SSL'):
+        imaplib.IMAP4_SSL.file = descriptor
+
+    # Patch IMAP4_stream if exists
+    if hasattr(imaplib, 'IMAP4_stream'):
+        imaplib.IMAP4_stream.file = descriptor
+
+# Apply the fix immediately
+_make_imaplib_file_writable()
+
 
 # ----------------------------- Configuration -----------------------------
 
