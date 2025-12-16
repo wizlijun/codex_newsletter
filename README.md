@@ -28,6 +28,7 @@
     - `--dry-run` 仅预览将处理的文件与命令
     - `--limit N` 仅处理最近 N 封新增邮件
     - `-v/--verbose` 输出更多信息
+  - 处理约定：若生成的 JSON 为 0 字节，则视为失败并立即删除，不保留空文件。
   - 例：`python readmail.py --dry-run -v`
 - `runloop.py`: 周期调度器。每轮先运行 `getmail.py`，紧接着运行 `readmail.py`，然后倒计时等待下一轮。
   - 例：

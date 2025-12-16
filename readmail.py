@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import List, Optional
 
@@ -215,6 +216,12 @@ def main() -> None:
                 last_err_msg = f"异常: {e}"
                 if args.verbose:
                     print(f"[readmail] 调用异常，{last_err_msg}", file=sys.stderr)
+                # 若已落地空文件，立即清理
+                try:
+                    if output_json.exists() and output_json.stat().st_size == 0:
+                        output_json.unlink()
+                except Exception:
+                    pass
             else:
                 if proc.returncode != 0:
                     stderr = (proc.stderr or "").strip()
@@ -223,11 +230,31 @@ def main() -> None:
                     )
                     if args.verbose:
                         print(f"[readmail] {last_err_msg}", file=sys.stderr)
+                    # 若 codex 过程中已创建了空文件，则立即清理
+                    try:
+                        if output_json.exists() and output_json.stat().st_size == 0:
+                            output_json.unlink()
+                    except Exception:
+                        pass
                 else:
-                    # 成功返回，确认文件已生成
+                    # 成功返回，确认文件已生成且非空
                     if output_json.exists():
-                        success = True
-                        break
+                        try:
+                            size = output_json.stat().st_size
+                        except Exception:
+                            size = -1
+                        if size and size > 0:
+                            success = True
+                            break
+                        else:
+                            # 生成了 0 字节文件，视为失败并清理
+                            last_err_msg = "codex 返回成功但生成了空 JSON（0 字节），已删除。"
+                            try:
+                                output_json.unlink()
+                            except Exception:
+                                pass
+                            if args.verbose:
+                                print(f"[readmail] {last_err_msg}", file=sys.stderr)
                     else:
                         last_err_msg = "codex 成功返回但未生成预期输出文件"
                         if args.verbose:
@@ -238,6 +265,46 @@ def main() -> None:
                 time.sleep(1)
 
         if success:
+            # 生成成功后校验并清理可能的 Markdown 代码围栏
+            try:
+                raw = output_json.read_text(encoding="utf-8")
+                raw_stripped = raw.lstrip()
+                # 若已是合法 JSON，则无需处理
+                try:
+                    json.loads(raw)
+                except Exception:
+                    # 若以 ``` 开头（常见为 ```json\n...\n```），则仅保留 [ 到 ] 的部分
+                    if raw_stripped.startswith("```"):
+                        start = raw.find("[")
+                        end = raw.rfind("]")
+                        if start != -1 and end != -1 and start < end:
+                            trimmed = raw[start : end + 1]
+                            try:
+                                json.loads(trimmed)
+                            except Exception:
+                                # 裁剪后仍非合法 JSON，保留原文件，仅提示
+                                if args.verbose:
+                                    print(
+                                        f"[readmail] 警告: 代码围栏裁剪后 JSON 仍不合法，未修改: {output_json}",
+                                        file=sys.stderr,
+                                    )
+                            else:
+                                output_json.write_text(trimmed, encoding="utf-8")
+                                if args.verbose:
+                                    print(
+                                        f"[readmail] 检测到围栏代码块，已裁剪为纯 JSON 数组: {output_json}"
+                                    )
+                    # 非 ``` 开头则不做特殊处理，只在 verbose 下提示
+                    else:
+                        if args.verbose:
+                            print(
+                                f"[readmail] 警告: 输出看起来不是合法 JSON，但未检测到 ``` 开头，未修改: {output_json}",
+                                file=sys.stderr,
+                            )
+            except Exception as e:
+                if args.verbose:
+                    print(f"[readmail] 后处理检查失败: {e}", file=sys.stderr)
+
             if args.verbose:
                 print(f"[readmail] 已生成: {output_json}")
             continue
@@ -245,9 +312,15 @@ def main() -> None:
             # 连续失败则跳过该邮件；确保没有残留的部分输出
             if output_json.exists():
                 try:
-                    output_json.unlink()
+                    # 若为 0 字节或残留半成品，一并删除
+                    if output_json.stat().st_size == 0:
+                        output_json.unlink()
                 except Exception:
-                    pass
+                    # 兜底：尝试直接删除
+                    try:
+                        output_json.unlink()
+                    except Exception:
+                        pass
             errors += 1
             print(
                 f"[readmail] 处理 {input_md.name} 失败（已重试 2 次），跳过生成 JSON。最后错误：{last_err_msg}",

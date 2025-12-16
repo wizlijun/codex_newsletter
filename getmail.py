@@ -452,6 +452,25 @@ class IMAPClientSession(BaseIMAPSession):
             pass
         self.client = None
 
+    def _detect_all_mail_folder(self) -> Optional[str]:
+        """Attempt to find Gmail's All Mail folder using special-use flags."""
+        assert self.client is not None
+        try:
+            folders = self.client.list_folders()
+        except Exception:
+            return None
+        for flags, delim, name in folders:
+            # Normalize flags to strings
+            norm_flags = []
+            for f in (flags or []):
+                try:
+                    norm_flags.append(f.decode() if isinstance(f, (bytes, bytearray)) else str(f))
+                except Exception:
+                    norm_flags.append(str(f))
+            if any(flag.upper() == r"\ALL" for flag in norm_flags):
+                return name
+        return None
+
     def select_mailbox(self, mailbox: Optional[str] = None) -> str:
         assert self.client is not None
         target = mailbox or self.mailbox
@@ -460,6 +479,18 @@ class IMAPClientSession(BaseIMAPSession):
             self.mailbox = target
             return target
         except Exception:
+            # Try auto-detecting All Mail if target looks like All Mail
+            looks_all_mail = bool(target) and ("all mail" in target.lower() or target.strip() in ("[Gmail]/All Mail", "[Google Mail]/All Mail"))
+            if looks_all_mail:
+                detected = self._detect_all_mail_folder()
+                if detected:
+                    try:
+                        self.client.select_folder(detected, readonly=True)
+                        self.mailbox = detected
+                        logging.info("Selected detected All Mail folder: %s", detected)
+                        return detected
+                    except Exception:
+                        pass
             logging.warning("Failed to select mailbox '%s'. Falling back to INBOX.", target)
             self.client.select_folder("INBOX", readonly=True)
             self.mailbox = "INBOX"
@@ -566,11 +597,50 @@ class ImaplibSession(BaseIMAPSession):
             pass
         self.conn = None
 
+    def _detect_all_mail_folder(self) -> Optional[str]:
+        assert self.conn is not None
+        try:
+            typ, data = self.conn.list()
+            if typ != "OK" or not data:
+                return None
+        except Exception:
+            return None
+        for line in data:
+            try:
+                text = line.decode() if isinstance(line, (bytes, bytearray)) else str(line)
+            except Exception:
+                text = str(line)
+            # Example: (\\HasNoChildren \\All) "/" "[Gmail]/All Mail"
+            # Extract flags and mailbox name
+            m = re.search(r"\((?P<flags>[^)]*)\)\s+\"(?P<delim>.*?)\"\s+(?P<name>.*)$", text)
+            if not m:
+                continue
+            flags_txt = m.group("flags") or ""
+            name_txt = m.group("name") or ""
+            # name may be quoted; strip quotes
+            name_txt = name_txt.strip()
+            if name_txt.startswith('"') and name_txt.endswith('"'):
+                name_txt = name_txt[1:-1]
+            flags = [f.strip() for f in flags_txt.split()] if flags_txt else []
+            if any(f.upper() == r"\ALL" for f in flags):
+                return name_txt
+        return None
+
     def select_mailbox(self, mailbox: Optional[str] = None) -> str:
         assert self.conn is not None
         target = mailbox or self.mailbox
         typ, _ = self.conn.select(target, readonly=True)
         if typ != "OK":
+            # Try auto-detecting All Mail if target looks like All Mail
+            looks_all_mail = bool(target) and ("all mail" in target.lower() or target.strip() in ("[Gmail]/All Mail", "[Google Mail]/All Mail"))
+            if looks_all_mail:
+                detected = self._detect_all_mail_folder()
+                if detected:
+                    typ2, _ = self.conn.select(detected, readonly=True)
+                    if typ2 == "OK":
+                        self.mailbox = detected
+                        logging.info("Selected detected All Mail folder: %s", detected)
+                        return detected
             logging.warning("Failed to select mailbox '%s'. Falling back to INBOX.", target)
             typ, _ = self.conn.select("INBOX", readonly=True)
             if typ != "OK":

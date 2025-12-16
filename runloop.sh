@@ -1,10 +1,12 @@
 #!/bin/bash
 
+source .venv/bin/activate
+
 # 周期运行器：每隔固定时间执行一次任务，并在控制台显示倒计时和详细日志。
 # 每轮会先运行 getmail.py，随后立即运行 readmail.py。
 #
 # 用法示例：
-#   - 直接运行（默认 5 分钟，默认使用 newsletter.yml）：
+#   - 直接运行（默认 901 秒，默认使用 newsletter.yml）：
 #       ./runloop.sh
 #   - 指定间隔为 10 分钟：
 #       ./runloop.sh 600
@@ -12,7 +14,7 @@
 #       ./runloop.sh 300 --config newsletter.yml -v
 
 # 默认间隔时间（秒）
-INTERVAL=${1:-300}
+INTERVAL=${1:-901}
 shift  # 移除第一个参数，剩下的都传给 getmail.py
 
 # 如果没有传递额外参数，使用默认配置
