@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 # Optional deps
 try:
@@ -41,6 +42,11 @@ try:
 except Exception:
     html2text = None  # type: ignore
 
+try:
+    import socks  # type: ignore
+except Exception:
+    socks = None  # type: ignore
+
 import imaplib
 import yaml
 
@@ -54,6 +60,16 @@ class ImapSettings:
     port: int
     ssl: bool
     mailbox: str
+
+
+@dataclass
+class ProxySettings:
+    enabled: bool
+    proxy_type: str  # http, socks4, socks5
+    host: str
+    port: int
+    username: Optional[str] = None
+    password: Optional[str] = None
 
 
 @dataclass
@@ -80,6 +96,7 @@ class AppConfig:
     email: EmailConfig
     runtime: RuntimeConfig
     fetch: FetchConfig
+    proxy: Optional[ProxySettings] = None
 
 
 def load_config(path: Path, override_out: Optional[str], override_mailbox: Optional[str], override_batch: Optional[int]) -> AppConfig:
@@ -144,6 +161,48 @@ def load_config(path: Path, override_out: Optional[str], override_mailbox: Optio
         print("ERROR: email.password is required", file=sys.stderr)
         sys.exit(1)
 
+    # Parse proxy settings
+    proxy_settings = None
+    proxy_node = data.get("proxy")
+    if proxy_node:
+        try:
+            if isinstance(proxy_node, str):
+                # Parse proxy URL like http://127.0.0.1:1087 or socks5://user:pass@host:port
+                parsed = urlparse(proxy_node)
+                proxy_type = parsed.scheme.lower() if parsed.scheme else "http"
+                proxy_host = parsed.hostname or "127.0.0.1"
+                proxy_port = parsed.port or 1080
+                proxy_username = parsed.username
+                proxy_password = parsed.password
+
+                # Map http/https to http proxy type
+                if proxy_type in ("http", "https"):
+                    proxy_type = "http"
+                elif proxy_type.startswith("socks"):
+                    proxy_type = proxy_type  # socks4, socks5, socks5h
+
+                proxy_settings = ProxySettings(
+                    enabled=True,
+                    proxy_type=proxy_type,
+                    host=proxy_host,
+                    port=proxy_port,
+                    username=proxy_username,
+                    password=proxy_password,
+                )
+            elif isinstance(proxy_node, dict):
+                # Parse proxy dict
+                proxy_settings = ProxySettings(
+                    enabled=bool(proxy_node.get("enabled", True)),
+                    proxy_type=str(proxy_node.get("type", "http")).lower(),
+                    host=str(proxy_node.get("host", "127.0.0.1")),
+                    port=int(proxy_node.get("port", 1080)),
+                    username=proxy_node.get("username"),
+                    password=proxy_node.get("password"),
+                )
+        except Exception as e:
+            logging.warning("Failed to parse proxy settings: %s", e)
+            proxy_settings = None
+
     cfg = AppConfig(
         email=EmailConfig(
             provider=provider,
@@ -153,6 +212,7 @@ def load_config(path: Path, override_out: Optional[str], override_mailbox: Optio
         ),
         runtime=RuntimeConfig(out_dir=out_dir, state_file=state_file),
         fetch=FetchConfig(batch_size=batch_size),
+        proxy=proxy_settings,
     )
     return cfg
 
@@ -407,14 +467,47 @@ def exponential_backoff_delays(retries: int) -> List[float]:
 # ----------------------------- IMAP Sessions -----------------------------
 
 
+def create_proxy_socket(host: str, port: int, proxy: ProxySettings) -> Any:
+    """
+    Create a socket connection through a proxy.
+    Requires PySocks library (pip install PySocks).
+    """
+    if socks is None:
+        raise RuntimeError("PySocks library not available. Install it with: pip install PySocks")
+
+    # Map proxy type to socks constants
+    proxy_type_map = {
+        "http": socks.HTTP,
+        "socks4": socks.SOCKS4,
+        "socks5": socks.SOCKS5,
+    }
+
+    proxy_type_value = proxy_type_map.get(proxy.proxy_type.lower())
+    if proxy_type_value is None:
+        raise ValueError(f"Unsupported proxy type: {proxy.proxy_type}")
+
+    # Create socket with proxy
+    sock = socks.socksocket()
+    sock.set_proxy(
+        proxy_type=proxy_type_value,
+        addr=proxy.host,
+        port=proxy.port,
+        username=proxy.username,
+        password=proxy.password,
+    )
+    sock.connect((host, port))
+    return sock
+
+
 class BaseIMAPSession:
-    def __init__(self, username: str, password: str, host: str, port: int, use_ssl: bool, mailbox: str) -> None:
+    def __init__(self, username: str, password: str, host: str, port: int, use_ssl: bool, mailbox: str, proxy: Optional[ProxySettings] = None) -> None:
         self.username = username
         self.password = password
         self.host = host
         self.port = port
         self.use_ssl = use_ssl
         self.mailbox = mailbox
+        self.proxy = proxy
 
     def connect(self) -> None:
         raise NotImplementedError
@@ -433,13 +526,57 @@ class BaseIMAPSession:
 
 
 class IMAPClientSession(BaseIMAPSession):
-    def __init__(self, username: str, password: str, host: str, port: int, use_ssl: bool, mailbox: str) -> None:
-        super().__init__(username, password, host, port, use_ssl, mailbox)
+    def __init__(self, username: str, password: str, host: str, port: int, use_ssl: bool, mailbox: str, proxy: Optional[ProxySettings] = None) -> None:
+        super().__init__(username, password, host, port, use_ssl, mailbox, proxy)
         self.client: Optional[IMAPClient] = None  # type: ignore
+        self._proxy_set = False
+
+    def _setup_proxy(self) -> None:
+        """Setup global proxy for socks module."""
+        if not self.proxy or not self.proxy.enabled or self._proxy_set:
+            return
+
+        if socks is None:
+            raise RuntimeError("PySocks library not available. Install it with: pip install PySocks")
+
+        # Map proxy type to socks constants
+        proxy_type_map = {
+            "http": socks.HTTP,
+            "socks4": socks.SOCKS4,
+            "socks5": socks.SOCKS5,
+        }
+
+        proxy_type_value = proxy_type_map.get(self.proxy.proxy_type.lower())
+        if proxy_type_value is None:
+            raise ValueError(f"Unsupported proxy type: {self.proxy.proxy_type}")
+
+        logging.info("Setting up %s proxy %s:%s for socket connections", self.proxy.proxy_type, self.proxy.host, self.proxy.port)
+
+        # Set default proxy for all socket connections
+        socks.set_default_proxy(
+            proxy_type=proxy_type_value,
+            addr=self.proxy.host,
+            port=self.proxy.port,
+            username=self.proxy.username,
+            password=self.proxy.password,
+        )
+        # Replace socket module's socket with socksocket
+        import socket as socket_module
+        socket_module.socket = socks.socksocket
+        self._proxy_set = True
 
     def connect(self) -> None:
         assert IMAPClient is not None
+
+        # Setup proxy if configured
+        self._setup_proxy()
+
         ssl_context = ssl.create_default_context()
+
+        if self.proxy and self.proxy.enabled:
+            logging.info("Connecting to %s:%s via %s proxy %s:%s", self.host, self.port, self.proxy.proxy_type, self.proxy.host, self.proxy.port)
+
+        # Now create IMAPClient normally - it will use the proxied socket
         self.client = IMAPClient(self.host, port=self.port, ssl=self.use_ssl, ssl_context=ssl_context)
         self.client.login(self.username, self.password)
         self.select_mailbox(self.mailbox)
@@ -571,15 +708,58 @@ class IMAPClientSession(BaseIMAPSession):
 
 
 class ImaplibSession(BaseIMAPSession):
-    def __init__(self, username: str, password: str, host: str, port: int, use_ssl: bool, mailbox: str) -> None:
-        super().__init__(username, password, host, port, use_ssl, mailbox)
+    def __init__(self, username: str, password: str, host: str, port: int, use_ssl: bool, mailbox: str, proxy: Optional[ProxySettings] = None) -> None:
+        super().__init__(username, password, host, port, use_ssl, mailbox, proxy)
         self.conn: Optional[imaplib.IMAP4] = None
+        self._proxy_set = False
+
+    def _setup_proxy(self) -> None:
+        """Setup global proxy for socks module."""
+        if not self.proxy or not self.proxy.enabled or self._proxy_set:
+            return
+
+        if socks is None:
+            raise RuntimeError("PySocks library not available. Install it with: pip install PySocks")
+
+        # Map proxy type to socks constants
+        proxy_type_map = {
+            "http": socks.HTTP,
+            "socks4": socks.SOCKS4,
+            "socks5": socks.SOCKS5,
+        }
+
+        proxy_type_value = proxy_type_map.get(self.proxy.proxy_type.lower())
+        if proxy_type_value is None:
+            raise ValueError(f"Unsupported proxy type: {self.proxy.proxy_type}")
+
+        logging.info("Setting up %s proxy %s:%s for socket connections", self.proxy.proxy_type, self.proxy.host, self.proxy.port)
+
+        # Set default proxy for all socket connections
+        socks.set_default_proxy(
+            proxy_type=proxy_type_value,
+            addr=self.proxy.host,
+            port=self.proxy.port,
+            username=self.proxy.username,
+            password=self.proxy.password,
+        )
+        # Replace socket module's socket with socksocket
+        import socket as socket_module
+        socket_module.socket = socks.socksocket
+        self._proxy_set = True
 
     def connect(self) -> None:
+        # Setup proxy if configured
+        self._setup_proxy()
+
+        if self.proxy and self.proxy.enabled:
+            logging.info("Connecting to %s:%s via %s proxy %s:%s", self.host, self.port, self.proxy.proxy_type, self.proxy.host, self.proxy.port)
+
+        # Create IMAP connection - it will use the proxied socket
         if self.use_ssl:
             self.conn = imaplib.IMAP4_SSL(self.host, self.port)
         else:
             self.conn = imaplib.IMAP4(self.host, self.port)
+
         typ, data = self.conn.login(self.username, self.password)  # type: ignore[union-attr]
         if typ != "OK":
             raise RuntimeError("Login failed")
@@ -752,6 +932,7 @@ class ImaplibSession(BaseIMAPSession):
 
 
 def build_session(cfg: AppConfig) -> BaseIMAPSession:
+    proxy = cfg.proxy if cfg.proxy and cfg.proxy.enabled else None
     if IMAPClient is not None:
         return IMAPClientSession(
             cfg.email.username,
@@ -760,6 +941,7 @@ def build_session(cfg: AppConfig) -> BaseIMAPSession:
             cfg.email.imap.port,
             cfg.email.imap.ssl,
             cfg.email.imap.mailbox,
+            proxy,
         )
     else:
         return ImaplibSession(
@@ -769,6 +951,7 @@ def build_session(cfg: AppConfig) -> BaseIMAPSession:
             cfg.email.imap.port,
             cfg.email.imap.ssl,
             cfg.email.imap.mailbox,
+            proxy,
         )
 
 

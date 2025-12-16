@@ -3,7 +3,7 @@
 source .venv/bin/activate
 
 # 周期运行器：每隔固定时间执行一次任务，并在控制台显示倒计时和详细日志。
-# 每轮会先运行 getmail.py，随后立即运行 readmail.py。
+# 每轮会先运行 getmail.py，随后立即运行 readmail_qwen.py。
 #
 # 用法示例：
 #   - 直接运行（默认 901 秒，默认使用 newsletter.yml）：
@@ -83,17 +83,17 @@ while true; do
     duration=$((end_time - start_time))
     echo "[runloop] getmail.py 结束，退出码 $rc_getmail，耗时 ${duration}s"
     
-    # 运行 readmail.py
-    echo "[runloop] 启动 readmail.py..."
+    # 运行 readmail_qwen.py
+    echo "[runloop] 启动 readmail_qwen.py..."
     start_time=$(date +%s)
-    if $PYTHON readmail.py; then
+    if $PYTHON readmail_qwen.py; then
         rc_readmail=0
     else
         rc_readmail=$?
     fi
     end_time=$(date +%s)
     duration=$((end_time - start_time))
-    echo "[runloop] readmail.py 结束，退出码 $rc_readmail，耗时 ${duration}s"
+    echo "[runloop] readmail_qwen.py 结束，退出码 $rc_readmail，耗时 ${duration}s"
     
     echo "-------------------------------------------------------------------------------"
     
