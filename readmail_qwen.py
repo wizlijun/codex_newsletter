@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import time
 import sys
 from dataclasses import dataclass
@@ -99,7 +100,7 @@ def run_qwen_api(
     timeout: Optional[int] = None,
     model: Optional[str] = None,
     max_retries: int = 2,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """
     使用 Qwen API 处理邮件，将合并后的 prompt+邮件内容发送给 Qwen。
 
@@ -112,15 +113,15 @@ def run_qwen_api(
     - max_retries: 最大重试次数
 
     返回：
-    - (成功标志, 错误信息)
+    - (成功标志, 错误信息, 是否安全拦截)
     """
     # 检查 OpenAI 库是否可用
     if not openai_available:
-        return False, "OpenAI 库不可用，请安装: pip install openai"
+        return False, "OpenAI 库不可用，请安装: pip install openai", False
 
     # 检查配置
     if config is None:
-        return False, "配置加载失败"
+        return False, "配置加载失败", False
 
     # 获取 Qwen 配置
     qwen_config = config.get_qwen_config()
@@ -130,7 +131,7 @@ def run_qwen_api(
     config_timeout = qwen_config.get('timeout', 120)
 
     if not api_key:
-        return False, "Qwen API Key 未配置"
+        return False, "Qwen API Key 未配置", False
 
     # 使用指定的模型或配置中的默认模型
     use_model = model or default_model
@@ -142,7 +143,7 @@ def run_qwen_api(
         mail_text = input_md.read_text(encoding="utf-8")
         combined = f"{prompt_text}\n\n{mail_text}"
     except Exception as e:
-        return False, f"读取文件失败: {e}"
+        return False, f"读取文件失败: {e}", False
 
     # 确保输出目录存在
     output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -177,26 +178,35 @@ def run_qwen_api(
                 if response_content:
                     # 写入输出文件
                     output_json.write_text(response_content, encoding="utf-8")
-                    return True, ""
+                    return True, "", False
                 else:
                     if attempt < max_retries:
                         time.sleep(1)
                         continue
-                    return False, "Qwen 返回空响应"
+                    return False, "Qwen 返回空响应", False
             else:
                 if attempt < max_retries:
                     time.sleep(1)
                     continue
-                return False, "Qwen API 响应为空"
+                return False, "Qwen API 响应为空", False
 
         except Exception as e:
             error_msg = str(e)
+
+            # 检测是否为安全拦截错误
+            is_content_inspection = False
+            if "data_inspection_failed" in error_msg or "inappropriate content" in error_msg.lower():
+                is_content_inspection = True
+                # 安全拦截错误不重试，直接返回
+                return False, f"Qwen API 安全拦截: {error_msg}", True
+
+            # 非安全拦截错误，继续重试
             if attempt < max_retries:
                 time.sleep(1)
                 continue
-            return False, f"Qwen API 调用异常: {error_msg}"
+            return False, f"Qwen API 调用异常: {error_msg}", False
 
-    return False, "所有重试都失败了"
+    return False, "所有重试都失败了", False
 
 
 def main() -> None:
@@ -229,6 +239,10 @@ def main() -> None:
 
     ensure_dir(paths.read_dir)
 
+    # 确保错误目录存在
+    err_dir = paths.mail_dir.parent / "err"
+    ensure_dir(err_dir)
+
     pending_ids = list_new_mail_ids(paths.mail_dir, paths.read_dir)
     if args.limit is not None and args.limit > 0:
         pending_ids = pending_ids[-args.limit :]
@@ -251,6 +265,7 @@ def main() -> None:
         return
 
     errors = 0
+    blocked_by_safety = 0
     for idx, mail_id in enumerate(pending_ids, start=1):
         input_md = paths.mail_dir / f"{mail_id}.md"
         output_json = paths.read_dir / f"{mail_id}.json"
@@ -258,7 +273,7 @@ def main() -> None:
             print(f"[readmail] ({idx}/{len(pending_ids)}) 处理 {input_md.name} …")
 
         # 调用 Qwen API（内部已包含重试逻辑）
-        success, error_msg = run_qwen_api(
+        success, error_msg, is_safety_blocked = run_qwen_api(
             paths.prompt_file,
             input_md,
             output_json,
@@ -335,15 +350,46 @@ def main() -> None:
                     output_json.unlink()
                 except Exception:
                     pass
-            errors += 1
-            print(
-                f"[readmail] 处理 {input_md.name} 失败（已重试 2 次），跳过生成 JSON。最后错误：{error_msg}",
-                file=sys.stderr,
-            )
 
-    if errors:
-        print(f"[readmail] 完成，存在 {errors} 个失败。", file=sys.stderr)
-        sys.exit(2)
+            # 检查是否为安全拦截
+            if is_safety_blocked:
+                # 安全拦截：将邮件移动到 err 目录
+                try:
+                    err_file = err_dir / input_md.name
+                    # 如果 err 目录中已存在同名文件，先删除
+                    if err_file.exists():
+                        err_file.unlink()
+                    # 移动文件
+                    shutil.move(str(input_md), str(err_file))
+                    blocked_by_safety += 1
+                    print(
+                        f"[readmail] 邮件 {input_md.name} 被安全拦截，已移动到 {err_dir}/",
+                        file=sys.stderr,
+                    )
+                except Exception as e:
+                    errors += 1
+                    print(
+                        f"[readmail] 邮件 {input_md.name} 被安全拦截，但移动到 err 目录失败: {e}",
+                        file=sys.stderr,
+                    )
+            else:
+                # 其他错误
+                errors += 1
+                print(
+                    f"[readmail] 处理 {input_md.name} 失败（已重试 2 次），跳过生成 JSON。最后错误：{error_msg}",
+                    file=sys.stderr,
+                )
+
+    # 输出最终统计
+    if errors or blocked_by_safety:
+        summary_parts = []
+        if errors:
+            summary_parts.append(f"{errors} 个失败")
+        if blocked_by_safety:
+            summary_parts.append(f"{blocked_by_safety} 个被安全拦截并移至 err/")
+        print(f"[readmail] 完成，{', '.join(summary_parts)}。", file=sys.stderr)
+        if errors:
+            sys.exit(2)
     else:
         print("[readmail] 全部完成。")
 
